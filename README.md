@@ -47,8 +47,14 @@ You need a supported model, an unlocked bootloader and Android 9 firmware. The L
 | Unlocked bootloader | `fastboot getvar unlocked` → `unlocked: yes` |
 | Android 9 firmware (US998: US99830b) | read it from the `laf` partition, below |
 | TWRP installed (3.7 used here) | reached with `adb reboot recovery` |
-| Linux PC with adb, fastboot, python3 | `adb version` |
+| Linux PC with [adb and fastboot](https://developer.android.com/tools/releases/platform-tools), python3, git, curl, bc | `adb version` |
 | About 10 GB free, if you'll build the root kernel | `df -h ~` |
+
+**Not covered here.** This guide starts from an unlocked phone with TWRP. For the steps before that:
+
+- **Unlocking the bootloader:** LG's official unlock program is gone, and the LineageOS wiki lists no official method for joan. The usual route is the XDA [bootloader unlock and root method](https://xdaforums.com/t/lg-v30-v30-v30s-bootloader-unlock-root-method-with-clear-instructions.3790500/) thread. The LineageOS wiki's pages for [variant 1](https://wiki.lineageos.org/devices/joan/variant1/), [variant 2](https://wiki.lineageos.org/devices/joan/variant2/) and [variant 3](https://wiki.lineageos.org/devices/joan/variant3/) describe each model group.
+- **TWRP:** [TWRP 3.7.0 for LG V30 (joan)](https://xdaforums.com/t/recovery-unofficial-twrp-3-7-0-for-lg-v30-joan.4558185/) on XDA, which supports all V30 models.
+- **Android 9 firmware:** for the US998, the [US99830b KDZ thread](https://xdaforums.com/t/us998-stock-pie-lg-v30-us998-us99830b_00_0902-kdz.3952256/) has the KDZ and a patched LGUP (LGUP's Upgrade mode can't be used while TWRP is installed), and there's a [TWRP-flashable 30b firmware](https://xdaforums.com/t/rom-fw-stock-pie-lg-v30-joan-us998-30b-twrp-flashable-firmware-rom.3973811/). Other models have equivalent threads in XDA's LG V30 forums.
 
 **Checking the firmware.** The `laf` partition (Download Mode) is a small LG boot image that carries the firmware's version. From TWRP's root shell, copy it to the PC, unpack it and read its properties:
 
@@ -215,17 +221,28 @@ Look for `net=LTE`, and `net=IWLAN` when on Wi-Fi.
 
 Root means rebuilding the official kernel with [RKSU](https://github.com/rsuntk/KernelSU) built in. The V30 runs a 4.4 kernel, which can't use KernelSU's loadable-module mode, and the official kernel has kprobes off, so RKSU needs manual hooks compiled into the kernel. Build the exact source and toolchain behind your LineageOS build, so the only differences are the ones you add on purpose.
 
-`kernel/prepare-rksu.sh` does steps 2 and 3 plus the extra patches, `kernel/build-kernel.sh` does step 4, and `kernel/repack-boot.sh` does step 5. They expect a work directory (`ROOT=` at the top of each script) containing `kernel-src/` (the kernel checkout), `rksu/` (the RKSU checkout), `toolchains/` and the phone's config as `official-<date>.config`.
+**The quick path.** The scripts do steps 1 to 6 for you. They keep sources, toolchains and build output in `work/` inside the repository (ignored by git); set `WORK=/some/path` to put it elsewhere. With the official `boot.img` and `build-manifest.xml` of the build you installed:
+
+```bash
+bash tools/fetch-sources.sh build-manifest.xml boot.img    # exact kernel commit + toolchains, RKSU, mkbootimg
+adb shell zcat /proc/config.gz > work/official.config       # phone still on the official kernel
+bash kernel/prepare-rksu.sh                                 # RKSU, hooks and the three patches (steps 2-3)
+bash kernel/build-kernel.sh                                 # step 4
+bash kernel/repack-boot.sh                                  # step 5, writes work/rksu-boot.img
+bash tools/flash-boot.sh work/rksu-boot.img                 # step 6, through Lineage Recovery's fastboot mode
+```
+
+The steps below explain what each script does. Everything was tested with the 2026-09-20 nightly. A newer nightly should work the same way with its own manifest and `boot.img`, but if LineageOS changes the kernel files the patches touch, `prepare-rksu.sh` stops with a patch error and the patch needs adjusting.
 
 ### 1. Gather the exact sources
 
-Read them from that build's `build-manifest.xml`. For the 2026-09-20 nightly:
+Read them from that build's `build-manifest.xml` (`tools/fetch-sources.sh` does this). For the 2026-09-20 nightly:
 
 | Piece | Where | Pin |
 |---|---|---|
 | Kernel | [LineageOS/android_kernel_lge_msm8998](https://github.com/LineageOS/android_kernel_lge_msm8998) | commit from the manifest (`c022ed57`) |
-| Compiler | AOSP `prebuilts/clang/host/linux-x86`, `clang-r536225` | tag `android-15.0.0_r32` |
-| Binutils | LineageOS `aarch64-linux-android-4.9` and `arm-linux-androideabi-4.9` | revisions from the manifest |
+| Compiler | AOSP [prebuilts/clang/host/linux-x86](https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/), `clang-r536225` | revision from the manifest (tag `android-15.0.0_r32`) |
+| Binutils | LineageOS [aarch64-linux-android-4.9](https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9) and [arm-linux-androideabi-4.9](https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9) | revisions from the manifest |
 | Config | the phone's own `/proc/config.gz` | plus `CONFIG_KSU=y`, `CONFIG_KSU_MANUAL_HOOK=y` |
 | RKSU | [rsuntk/KernelSU](https://github.com/rsuntk/KernelSU) `main` | `648e5988` (kernel 32473) |
 | Boot tools | [platform/system/tools/mkbootimg](https://android.googlesource.com/platform/system/tools/mkbootimg) | any |
@@ -315,11 +332,11 @@ What `reroot.sh` does:
 3. Otherwise it swaps in the rooted kernel, runs `magiskboot repack -n`, and checks that the result has the rooted kernel and the original ramdisk.
 4. Writes it, reads it back, and if the read-back doesn't match, writes the original back.
 
-Install both parts with a small flashable zip sideloaded from Lineage Recovery: `reroot/update-binary` as `META-INF/com/google/android/update-binary`, plus a `payload/` folder with the five `/cache/rksu` files and `99-rksu.sh`. It's unsigned, so tap **Yes** at the warning. The installer mounts `/system` the way the VoLTE zip does: it reuses recovery's own read-only mount and remounts it read-write, rather than mounting it a second time.
+Install both parts with a small flashable zip sideloaded from Lineage Recovery. `bash tools/make-reroot-zip.sh <RKSU manager .apk>` builds it as `work/rksu-reroot-installer.zip`: `reroot/update-binary` as the installer, plus a `payload/` folder with `99-rksu.sh`, `reroot.sh`, your rooted `Image.gz-dtb` and its hash, the official kernel's hash (taken from `work/boot.img`), and `magiskboot` (taken from the manager APK, where it's `lib/arm64-v8a/libmagiskboot.so`). It's unsigned, so tap **Yes** at the warning. The installer mounts `/system` the way the VoLTE zip does: it reuses recovery's own read-only mount and remounts it read-write, rather than mounting it a second time.
 
 **To test it**, sideload the same official zip you're already on, without wiping. That's a full update run. The phone should boot rooted, and `reroot.log` should say `boot partition re-rooted`. Here, the VoLTE stack's own addon.d script ran in the same pass.
 
-**When you rebuild the kernel** (for example after `NEEDS_REBUILD`, or to add a patch), update `/cache/rksu` with the new image and its hash. `tools/update-payload.sh <Image.gz-dtb> <rksu-boot.img>` does this, then dry-runs `reroot.sh` against the official `boot.img` and checks that it reproduces your flashed image byte for byte.
+**When you rebuild the kernel** (for example after `NEEDS_REBUILD`, or to add a patch), update `/cache/rksu` with the new image and its hash. `tools/update-payload.sh <Image.gz-dtb> <rksu-boot.img>` does this (it restores the previous payload if the check fails), then dry-runs `reroot.sh` against the official `boot.img` and checks that it reproduces your flashed image byte for byte.
 
 ## Stereo speakers
 
@@ -416,9 +433,8 @@ The unlock warning is `verifiedboot_orange_01` (with "PRESS THE POWER KEY TO PAU
 ### Doing it
 
 1. Get the Verizon `raw_resources`. If your phone started life as a VS996, it's probably still in your `raw_resourcesbak` partition; check the device name at offset 0x18 is `joan_vzw`. Otherwise, extract it from a VS996 KDZ, or take it from the AIX disabler zip. The one used here was byte-identical to the AIX file (`079a3509…` for the 3,649,536-byte image).
-2. Pad it with zeros to the partition size (4 MiB).
-3. Write it with checks: `tools/write-raw-resources.sh` confirms the live partition matches your backup, pushes the image and checks the push, writes with `dd`, then reads the partition back and compares hashes.
-4. Reboot and watch: a black screen for a few seconds, then the LG V30 ThinQ logo, then LineageOS.
+2. Write it with checks: `bash tools/write-raw-resources.sh <Verizon raw_resources image> <your backed-up raw_resources.img>`. It confirms the image is an LG container and the live partition matches your backup, pads the image to the partition size, pushes it and checks the push, writes with `dd`, then reads the partition back and compares hashes.
+3. Reboot and watch: a black screen for a few seconds, then the LG V30 ThinQ logo, then LineageOS.
 
 **Only ever write a genuine, signed container here.** Zeroing or garbling `raw_resources` has reportedly hard-bricked V30s into 9008 (EDL) mode. Updates don't touch this partition, so the change stays. To undo it, write back your backed-up `raw_resources.img` the same way.
 
@@ -434,16 +450,16 @@ These are small KernelSU modules (a `module.prop` plus a boot script, zipped, in
 | `hid-generic-fix` (ShanWan 2.4 GHz gamepads whose dongle switches to `20bc:5500`) | the pad works on newer phones but shows nothing on the V30 | the 4.4 kernel reserves `20bc:5500` for `hid-betopff`, which isn't built, so nothing binds. A watcher run from `/dev` re-adds the dongle's usbhid interfaces with `/sys/module/hid/parameters/ignore_special_drivers` set to 1, then back to 0, and `hid-generic` binds. |
 | `adb-wifi` (network adb) | controlling the phone from your PC over Wi-Fi | at post-fs-data, `setprop service.adb.tcp.port 5555`, so it's always on. Only computers you've already approved can connect. Then `adb connect <phone-ip>:5555` and `scrcpy -s <phone-ip>:5555 --no-audio --max-size 1440`. |
 
-Apps used here: Termux and Droid-ify from F-Droid (Termux add-ons must come from the same source as Termux), and Obtainium from GitHub for apps published only there.
+Apps used here: [Termux](https://f-droid.org/packages/com.termux/) and [Droid-ify](https://github.com/Droid-ify/client) from F-Droid (Termux add-ons must come from the same source as Termux), and [Obtainium](https://github.com/ImranR98/Obtainium) for apps published only on GitHub.
 
-If you use Key Mapper, it may turn on Android's separate "Wireless debugging" feature, which prompts at every boot. Network adb above doesn't need it.
+If you use [Key Mapper](https://github.com/keymapperorg/KeyMapper), it may turn on Android's separate "Wireless debugging" feature, which prompts at every boot. Network adb above doesn't need it.
 
 ## Considered but not done
 
 | Idea | Status | If you want it |
 |---|---|---|
-| **CRT screen-off animation** (as in crDroid) | LineageOS only has Android's plain fade; crDroid's CRT effect is crDroid's own change to `services.jar` | the AURA CTRL LSPosed module (Android 14–16) has "Classic CRT" and more. It needs Zygisk Next (or ReZygisk) plus LSPosed (JingMatrix fork) on KernelSU, which runs Zygisk inside every app and gives root-detecting apps more to see. Patching `services.jar` directly would have to be redone after every update. |
-| **Double-tap to sleep anywhere** | built in for the status bar and empty lock-screen space (Settings → System → Status bar); the home screen (Trebuchet) has no sleep gesture | a launcher that has one, such as Lawnchair (double-tap → "Lock screen", through its accessibility service) |
+| **CRT screen-off animation** (as in crDroid) | LineageOS only has Android's plain fade; crDroid's CRT effect is crDroid's own change to `services.jar` | the AURA CTRL LSPosed module (Android 14–16) has "Classic CRT" and more. It needs Zygisk Next or [ReZygisk](https://github.com/PerformanC/ReZygisk) plus [LSPosed (JingMatrix fork)](https://github.com/JingMatrix/LSPosed) on KernelSU, which runs Zygisk inside every app and gives root-detecting apps more to see. Patching `services.jar` directly would have to be redone after every update. |
+| **Double-tap to sleep anywhere** | built in for the status bar and empty lock-screen space (Settings → System → Status bar); the home screen (Trebuchet) has no sleep gesture | a launcher that has one, such as [Lawnchair](https://github.com/LawnchairLauncher/lawnchair) (double-tap → "Lock screen", through its accessibility service) |
 | **App sandboxing** (GrapheneOS-style profiles) | built in. **Private space** (Settings → Security & privacy): a separate locked profile whose apps fully stop while locked; good for occasional apps. Secondary users (up to 4). Work profiles via **Insular** (F-Droid; the de-Googled fork of Island), Island, or Shelter (maintenance mode). | GrapheneOS's extras (more users, ending a user's session, notification forwarding, hardened memory allocator) aren't available. Profiles share the clipboard, keyboard, network and device identity. |
 | **Dhizuku** (Shizuku with Device Owner) | incompatible with any work profile or Private space: Android won't set a Device Owner while a profile owner exists, and won't create a work profile on a Device Owner phone | on a rooted V30, run Shizuku in root mode instead; root covers most Device Owner uses (freezing, hiding, uninstall blocking) |
 
@@ -469,7 +485,7 @@ The guide's commands should also run in WSL2 (e.g. Ubuntu), with these workaroun
 
 | Issue | What happens | What to do |
 |---|---|---|
-| No USB access | `adb` and `fastboot` inside WSL2 don't see the phone at all | install usbipd-win on Windows and run `usbipd attach --wsl --busid <id> --auto-attach`, then use Linux `adb` and `fastboot` inside WSL. The phone shows up as a new USB device in each mode (Android, TWRP, Lineage Recovery, fastbootd), so `--auto-attach` re-attaches it after every reboot. |
+| No USB access | `adb` and `fastboot` inside WSL2 don't see the phone at all | install [usbipd-win](https://github.com/dorssel/usbipd-win) on Windows and run `usbipd attach --wsl --busid <id> --auto-attach`, then use Linux `adb` and `fastboot` inside WSL. The phone shows up as a new USB device in each mode (Android, TWRP, Lineage Recovery, fastbootd), so `--auto-attach` re-attaches it after every reboot. |
 | Using `adb.exe` / `fastboot.exe` from WSL | Windows tools end lines with a carriage return, so script checks such as `adb get-state` don't match and the scripts stop (safely). Fastboot mode also needs the Google USB driver. | prefer usbipd-win with the Linux tools |
 | Kernel source under `/mnt/c` | the Windows drive is case-insensitive, and kernel source has files whose names differ only by case; builds there are also much slower | keep the kernel source and toolchains in WSL's own Linux file system (`~/...`) |
 | Scripts with Windows line endings | a script saved with Windows (CRLF) line endings fails in bash with confusing errors | clone with `git config core.autocrlf false`, and edit in WSL or an editor set to LF line endings |
@@ -517,13 +533,15 @@ test-audio/
   lr-1khz.ogg                  left / right / both at the same pitch: loudness balance
   make-test-tones.py           regenerates both (needs ffmpeg)
 tools/
+  fetch-sources.sh             fetches the kernel source and toolchains a build's manifest names, plus RKSU
   flash-boot.sh                flashes a boot image through Lineage Recovery's fastboot mode
+  make-reroot-zip.sh           builds the re-root installer zip
   update-payload.sh            installs a new kernel into /cache/rksu and dry-runs the re-root
   write-raw-resources.sh       writes a raw_resources image with before/after checks
   actl.c                       libc-free ALSA mixer-control tool for testing on the phone
 ```
 
-The scripts set their working directory with `ROOT=` near the top; adjust it to yours. Zip a module's folder contents (not the folder) to install it.
+The scripts keep sources, toolchains and build output in `work/` (ignored by git); set `WORK=/some/path` to use another folder. Zip a module's folder contents (not the folder) to install it.
 
 ## Sources
 
@@ -534,6 +552,7 @@ The scripts set their working directory with `ROOT=` near the top; adjust it to 
 - [rsuntk/KernelSU (RKSU)](https://github.com/rsuntk/KernelSU)
 - [TosteRino/joan-kernelsu](https://github.com/TosteRino/joan-kernelsu) (manual hook placement for joan)
 - [AOSP mkbootimg tools](https://android.googlesource.com/platform/system/tools/mkbootimg)
+- XDA: [LG V30 bootloader unlock and root method](https://xdaforums.com/t/lg-v30-v30-v30s-bootloader-unlock-root-method-with-clear-instructions.3790500/), [TWRP 3.7.0 for joan](https://xdaforums.com/t/recovery-unofficial-twrp-3-7-0-for-lg-v30-joan.4558185/), [US998 30b KDZ](https://xdaforums.com/t/us998-stock-pie-lg-v30-us998-us99830b_00_0902-kdz.3952256/)
 - [AnandTech: DisplayPort Alternate Mode (LG V30)](https://forums.anandtech.com/threads/displayport-alternate-mode-lg-v30.2556545/)
 - [XDA: [Magisk] AOSP dual speaker mod (Mrxyzl)](https://xdaforums.com/t/magisk-aosp-dual-speaker-mod-enable-24-bit-output-for-poweramp-on-pie.3900863/)
 - [XDA: biQuads, Qualcomm codec IIR filters](https://xdaforums.com/t/mod-audio-biquads-utilizing-qualcomms-audio-codec-for-headphone-compensation.3093000/) (coefficient format)

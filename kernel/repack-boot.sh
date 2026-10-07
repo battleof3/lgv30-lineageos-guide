@@ -3,12 +3,13 @@
 # Usage: bash repack-boot.sh [stock-boot.img] [output.img]
 set -euo pipefail
 
-ROOT=~/Projects/lgv30-root
-STOCK=${1:-$HOME/Projects/lgv30-install/boot.img}
-OUTIMG=${2:-$ROOT/rksu-boot.img}
-KERNEL=$ROOT/kernel-src/out/arch/arm64/boot/Image.gz-dtb
-MKB=$ROOT/toolchains/mkbootimg
-W=$ROOT/work/repack
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+WORK=${WORK:-$REPO/work}   # sources, toolchains and build output (see tools/fetch-sources.sh)
+STOCK=${1:-$WORK/boot.img}
+OUTIMG=${2:-$WORK/rksu-boot.img}
+KERNEL=$WORK/kernel-src/out/arch/arm64/boot/Image.gz-dtb
+MKB=$WORK/toolchains/mkbootimg
+W=$WORK/repack
 
 rm -rf "$W"; mkdir -p "$W"
 python3 "$MKB/unpack_bootimg.py" --boot_img "$STOCK" --out "$W/stock" --format mkbootimg -0 > "$W/args"

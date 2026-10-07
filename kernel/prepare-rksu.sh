@@ -4,10 +4,12 @@
 # cross-checked against TosteRino/joan-kernelsu.
 set -euo pipefail
 
-ROOT=~/Projects/lgv30-root
-KSRC=$ROOT/kernel-src
-RKSU=$ROOT/rksu
-RKSU_REF=648e5988
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+WORK=${WORK:-$REPO/work}   # sources, toolchains and build output (see tools/fetch-sources.sh)
+KSRC=$WORK/kernel-src
+RKSU=$WORK/rksu
+RKSU_REF=${RKSU_REF:-HEAD}   # tools/fetch-sources.sh checks out the pinned commit
+PATCHES=$REPO/kernel
 
 cd "$KSRC"
 [[ -z $(git status --porcelain) && ! -e KernelSU ]] || { echo "kernel-src is not clean; refusing to patch twice."; exit 1; }
@@ -17,7 +19,7 @@ mkdir -p KernelSU
 git -C "$RKSU" archive "$RKSU_REF" kernel | tar -x -C KernelSU
 
 echo "[+] Applying local RKSU fixes (FBE keyring for ksu_cred, real init->ksu transition check)"
-patch -d KernelSU/kernel -p1 < "$ROOT/rksu-local-fixes.diff"
+patch -d KernelSU/kernel -p1 < "$PATCHES/rksu-local-fixes.diff"
 
 echo "[+] Wiring drivers/kernelsu"
 ln -sfn ../KernelSU/kernel drivers/kernelsu
@@ -168,12 +170,12 @@ insert("security/selinux/hooks.c", """	if (new_tsec->sid == old_tsec->sid)
 PY
 
 echo "[+] Applying LG V30 DisplayPort pixel-clock cap (dp-max-pclk.diff)"
-patch -d "$KSRC" -p1 < "$ROOT/dp-max-pclk.diff"
+patch -d "$KSRC" -p1 < "$PATCHES/dp-max-pclk.diff"
 
 echo "[+] Applying LG V30 dual speaker support (lgv30-dual-speaker.diff: amp slot + rotation swap, IIR1 caching fix)"
-patch -d "$KSRC" -p1 < "$ROOT/lgv30-dual-speaker.diff"
+patch -d "$KSRC" -p1 < "$PATCHES/lgv30-dual-speaker.diff"
 
 echo "[+] Hook diff summary:"
 git diff --stat
-git diff -- . ":(exclude)sound" ":(exclude)drivers/mfd" > "$ROOT/rksu-manual-hooks.diff"
-echo "[+] Saved $ROOT/rksu-manual-hooks.diff"
+git diff -- . ":(exclude)sound" ":(exclude)drivers/mfd" > "$WORK/rksu-manual-hooks.diff"
+echo "[+] Saved $WORK/rksu-manual-hooks.diff"
