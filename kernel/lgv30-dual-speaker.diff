@@ -1,0 +1,218 @@
+diff --git a/drivers/mfd/wcd934x-regmap.c b/drivers/mfd/wcd934x-regmap.c
+index 27249eee..ccd9e035 100644
+--- a/drivers/mfd/wcd934x-regmap.c
++++ b/drivers/mfd/wcd934x-regmap.c
+@@ -1891,9 +1891,15 @@ static bool wcd934x_is_volatile_register(struct device *dev, unsigned int reg)
+ 	if (reg_tbl && reg_tbl[reg_offset] == WCD934X_READ)
+ 		return true;
+ 
+-	/* IIR Coeff registers are not cacheable */
+-	if ((reg >= WCD934X_CDC_SIDETONE_IIR0_IIR_COEF_B1_CTL) &&
+-	    (reg <= WCD934X_CDC_SIDETONE_IIR1_IIR_COEF_B2_CTL))
++	/*
++	 * IIR Coeff registers are not cacheable. Only those four: a range from IIR0 COEF_B1 to
++	 * IIR1 COEF_B2 also swallowed IIR1's input gains and band enables, so they were never
++	 * cached and tavil_codec_set_iir_gain() could not restore them at power-up (LG V30).
++	 */
++	if (reg == WCD934X_CDC_SIDETONE_IIR0_IIR_COEF_B1_CTL ||
++	    reg == WCD934X_CDC_SIDETONE_IIR0_IIR_COEF_B2_CTL ||
++	    reg == WCD934X_CDC_SIDETONE_IIR1_IIR_COEF_B1_CTL ||
++	    reg == WCD934X_CDC_SIDETONE_IIR1_IIR_COEF_B2_CTL)
+ 		return true;
+ 
+ 	if ((reg >= WCD934X_CDC_ANC0_IIR_COEFF_1_CTL) &&
+diff --git a/sound/soc/codecs/tfa9872/tfa98xx.c b/sound/soc/codecs/tfa9872/tfa98xx.c
+index 1c38d1a9..b7a166ff 100644
+--- a/sound/soc/codecs/tfa9872/tfa98xx.c
++++ b/sound/soc/codecs/tfa9872/tfa98xx.c
+@@ -116,6 +116,40 @@ static int pcm_no_constraint = 0;
+ module_param(pcm_no_constraint, int, S_IRUGO);
+ MODULE_PARM_DESC(pcm_no_constraint, "do not use constraints for PCM paramaters\n");
+ 
++/* LG V30: TDM slot the speaker plays (TDMSPKS; the DCDC sink TDMDCS takes the other one),
++ * reapplied on every start since the amp is I2C-reset each time. -1 keeps the POR values
++ * (speaker slot 0 = left channel, DCDC slot 1). */
++int lgv30_spk_slot = -1;
++module_param(lgv30_spk_slot, int, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(lgv30_spk_slot, "speaker TDM slot: -1 default, 0 left, 1 right\n");
++
++/* Rotation: msm-pcm-routing's "Swap channel" control moves the speaker to the other slot. Cleared
++ * whenever the amp stops; the audio HAL sets it again on the next start if still rotated. */
++static bool lgv30_spk_swap;
++static struct tfa98xx *lgv30_tfa;
++
++int lgv30_spk_effective_slot(void)
++{
++	if (lgv30_spk_slot < 0 || lgv30_spk_slot > 1)
++		return -1;
++	return lgv30_spk_swap ? 1 - lgv30_spk_slot : lgv30_spk_slot;
++}
++
++/* Returns false when lgv30_spk_slot is off, so the caller keeps its stock behaviour. */
++bool lgv30_tfa_set_swap(bool swap)
++{
++	int slot;
++
++	if (lgv30_spk_slot < 0 || lgv30_spk_slot > 1)
++		return false;
++	lgv30_spk_swap = swap;
++	slot = lgv30_spk_effective_slot();
++	/* Takes effect live; tfa_start() reapplies it after the amp's I2C reset. */
++	if (lgv30_tfa)
++		regmap_update_bits(lgv30_tfa->regmap, 0x26, 0xff, ((1 - slot) << 4) | slot);
++	return true;
++}
++
+ #if defined(USE_TFA9891)
+ static void tfa98xx_tapdet_check_update(struct tfa98xx *tfa98xx);
+ #endif
+@@ -3363,6 +3397,7 @@ static int _tfa98xx_stop(struct tfa98xx *tfa98xx)
+ 	mutex_lock(&tfa98xx->dsp_lock);
+ 	pr_info("%s: stop tfa amp \n", __func__);
+ 	tfa_stop();
++	lgv30_spk_swap = false;
+ 	tfa98xx->dsp_init = TFA98XX_DSP_INIT_STOPPED;
+ 	mutex_unlock(&tfa98xx->dsp_lock);
+ 
+@@ -3752,6 +3787,7 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
+ 	}
+ 
+ 	i2c_set_clientdata(i2c, tfa98xx);
++	lgv30_tfa = tfa98xx;
+ 	mutex_init(&tfa98xx->dsp_lock);
+ 	init_waitqueue_head(&tfa98xx->wq);
+ 
+diff --git a/sound/soc/codecs/tfa9872/tfa_dsp.c b/sound/soc/codecs/tfa9872/tfa_dsp.c
+index f1b5b3f1..57bce81f 100644
+--- a/sound/soc/codecs/tfa9872/tfa_dsp.c
++++ b/sound/soc/codecs/tfa9872/tfa_dsp.c
+@@ -4035,6 +4035,8 @@ enum tfa98xx_error tfa_run_wait_calibration(tfa98xx_handle_t handle, int *calibr
+ 	return err;
+ }
+ 
++extern int lgv30_spk_effective_slot(void);
++
+ enum tfa98xx_error tfa_start(int next_profile, int *vstep)
+ {
+ 	enum tfa98xx_error err = TFA98XX_ERROR_OK;
+@@ -4192,6 +4194,16 @@ enum tfa98xx_error tfa_start(int next_profile, int *vstep)
+ 		if (tfa98xx_runtime_verbose && (tfa98xx_dev_family(dev) == 2))
+ 			show_current_state(dev);
+ 
++		/* Speaker sink and DCDC sink must use different slots (POR: 0 and 1) or the amp flags
++		 * a TDM LUT error, so move the DCDC sink to the other slot as well. */
++		{
++			int slot = lgv30_spk_effective_slot();
++
++			if (slot >= 0) {
++				tfa_set_bf(dev, 0x2603 /* TFA9872 TDMSPKS */, (uint16_t)slot);
++				tfa_set_bf(dev, 0x2643 /* TFA9872 TDMDCS */, (uint16_t)(1 - slot));
++			}
++		}
+ 		tfa_run_unmute(dev);	/* unmute */
+ 		tfa_cont_close(dev); /* close all of them */
+ 	}
+diff --git a/sound/soc/codecs/wcd934x/wcd934x.c b/sound/soc/codecs/wcd934x/wcd934x.c
+index 6c3d6188..7da67673 100644
+--- a/sound/soc/codecs/wcd934x/wcd934x.c
++++ b/sound/soc/codecs/wcd934x/wcd934x.c
+@@ -3849,7 +3849,18 @@ static int tavil_codec_set_iir_gain(struct snd_soc_dapm_widget *w,
+ 				WCD934X_CDC_SIDETONE_IIR1_IIR_GAIN_B3_CTL,
+ 			snd_soc_read(codec,
+ 				WCD934X_CDC_SIDETONE_IIR1_IIR_GAIN_B3_CTL));
++			snd_soc_write(codec,
++				WCD934X_CDC_SIDETONE_IIR1_IIR_GAIN_B4_CTL,
++			snd_soc_read(codec,
++				WCD934X_CDC_SIDETONE_IIR1_IIR_GAIN_B4_CTL));
+ 		}
++		/* Band enables written before power-up are lost as well; restore them from the cache. */
++		if (strnstr(w->name, "IIR0", sizeof("IIR0")))
++			snd_soc_write(codec, WCD934X_CDC_SIDETONE_IIR0_IIR_CTL,
++				snd_soc_read(codec, WCD934X_CDC_SIDETONE_IIR0_IIR_CTL));
++		else
++			snd_soc_write(codec, WCD934X_CDC_SIDETONE_IIR1_IIR_CTL,
++				snd_soc_read(codec, WCD934X_CDC_SIDETONE_IIR1_IIR_CTL));
+ 		break;
+ 	}
+ 	return 0;
+diff --git a/sound/soc/msm/qdsp6v2/msm-pcm-routing-v2.c b/sound/soc/msm/qdsp6v2/msm-pcm-routing-v2.c
+index 80195df3..71fe2362 100644
+--- a/sound/soc/msm/qdsp6v2/msm-pcm-routing-v2.c
++++ b/sound/soc/msm/qdsp6v2/msm-pcm-routing-v2.c
+@@ -22436,6 +22436,60 @@ static int msm_routing_stereo_channel_reverse_control_get(
+ 	return 0;
+ }
+ 
++#if defined(CONFIG_SND_SOC_TFA9872)
++extern bool lgv30_tfa_set_swap(bool swap);
++
++static struct snd_kcontrol *lgv30_find_ctl(struct snd_card *card, const char *name)
++{
++	struct snd_ctl_elem_id id;
++
++	memset(&id, 0, sizeof(id));
++	id.iface = SNDRV_CTL_ELEM_IFACE_MIXER;
++	strlcpy(id.name, name, sizeof(id.name));
++	return snd_ctl_find_id(card, &id);	/* controls_rwsem is held by the caller's write */
++}
++
++/*
++ * LG V30 dual speaker: the earpiece is fed through IIR1, input 0 = left, input 1 = right, with one
++ * of them at 0 (-84 dB). Swapping exchanges the two input levels. Any other state (calls, dual
++ * speaker off: neither or both inputs muted) is left untouched.
++ */
++static void lgv30_swap_earpiece(struct snd_kcontrol *kcontrol, bool swap)
++{
++	struct snd_soc_platform *platform = snd_soc_kcontrol_platform(kcontrol);
++	struct snd_card *card = platform->component.card->snd_card;
++	struct snd_kcontrol *k0 = lgv30_find_ctl(card, "IIR1 INP0 Volume");
++	struct snd_kcontrol *k1 = lgv30_find_ctl(card, "IIR1 INP1 Volume");
++	struct snd_ctl_elem_value *v0 = NULL, *v1 = NULL;
++	long a, b;
++
++	if (!k0 || !k1)
++		return;
++	v0 = kzalloc(sizeof(*v0), GFP_KERNEL);
++	v1 = kzalloc(sizeof(*v1), GFP_KERNEL);
++	if (!v0 || !v1)
++		goto out;
++	v0->id = k0->id;
++	v1->id = k1->id;
++	if (k0->get(k0, v0) < 0 || k1->get(k1, v1) < 0)
++		goto out;
++	/* These SX volume controls read back levels below 0 dB (84) as value + 256. */
++	a = v0->value.integer.value[0] % 256;
++	b = v1->value.integer.value[0] % 256;
++	if ((a == 0) == (b == 0))
++		goto out;
++	if ((a == 0) != swap) {		/* left muted = earpiece currently plays right = swapped */
++		v0->value.integer.value[0] = b;
++		v1->value.integer.value[0] = a;
++		k0->put(k0, v0);
++		k1->put(k1, v1);
++	}
++out:
++	kfree(v0);
++	kfree(v1);
++}
++#endif
++
+ static int msm_routing_stereo_channel_reverse_control_put(
+ 			struct snd_kcontrol *kcontrol,
+ 			struct snd_ctl_elem_value *ucontrol)
+@@ -22449,6 +22503,15 @@ static int msm_routing_stereo_channel_reverse_control_put(
+ 
+ 	swap_ch = ucontrol->value.integer.value[0];
+ 
++#if defined(CONFIG_SND_SOC_TFA9872)
++	/* LG V30 dual speaker: the ADM channel swap has no audible effect here, so swap the
++	 * speaker amp's TDM slot and the earpiece's input instead (both no-ops unless enabled). */
++	if (lgv30_tfa_set_swap(swap_ch)) {
++		lgv30_swap_earpiece(kcontrol, swap_ch);
++		return 0;
++	}
++#endif
++
+ 	mutex_lock(&routing_lock);
+ 	for (be_index = 0; be_index < MSM_BACKEND_DAI_MAX; be_index++) {
+ 		port_id = msm_bedais[be_index].port_id;

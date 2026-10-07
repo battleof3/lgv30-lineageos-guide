@@ -1,0 +1,6 @@
+id=adb_wifi_5555
+name=Network ADB on port 5555
+version=1.0
+versionCode=1
+author=lgv30
+description=Starts adbd listening on TCP 5555 at boot (for scrcpy/adb from the desktop). Clients still need RSA approval. Disable this module to turn it off.

@@ -1,0 +1,60 @@
+#!/sbin/sh
+# rksu-reroot-installer: installs /cache/rksu (payload) and /system/addon.d/99-rksu.sh
+# so RKSU root is restored automatically after LineageOS updates. Flash from LineageOS recovery.
+
+OUTFD=$2
+ZIPFILE=$3
+ui_print() { echo "ui_print $1" > /proc/self/fd/$OUTFD; echo "ui_print" > /proc/self/fd/$OUTFD; }
+abort() { ui_print "ERROR: $1"; exit 1; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+T=/tmp/rksu-inst
+rm -rf $T; mkdir -p $T
+unzip -o -q "$ZIPFILE" 'payload/*' -d $T || abort "cannot unpack zip"
+P=$T/payload
+
+ui_print "RKSU re-root installer (LG V30 / joan)"
+
+# --- /cache payload
+grep -q ' /cache ' /proc/mounts || mount /cache 2>/dev/null \
+  || mount -t ext4 /dev/block/bootdevice/by-name/cache /cache || abort "cannot mount /cache"
+mkdir -p /cache/rksu || abort "cannot create /cache/rksu"
+for f in Image.gz-dtb Image.gz-dtb.sha256 base-kernel.sha256 reroot.sh magiskboot; do
+  cp -f "$P/$f" /cache/rksu/$f || abort "copy $f"
+  [ "$(sha "$P/$f")" = "$(sha /cache/rksu/$f)" ] || abort "verify $f"
+done
+chmod 755 /cache/rksu/magiskboot /cache/rksu/reroot.sh
+ui_print "  /cache/rksu payload installed and verified"
+
+# --- self-test: magiskboot works here and the boot partition is already RKSU
+ui_print "  self-test (reads boot, writes nothing when already rooted):"
+RES=$(sh /cache/rksu/reroot.sh 2>&1 | tee -a /cache/rksu/reroot.log | tail -n 1)
+ui_print "    $RES"
+
+# --- /system/addon.d script (system is a logical partition; recovery may already hold it ro)
+DEV=$(readlink -f /dev/block/mapper/system 2>/dev/null)
+[ -b "$DEV" ] || abort "no /dev/block/mapper/system (use LineageOS recovery)"
+blockdev --setrw "$DEV" 2>/dev/null
+MP=$(mount | grep "^$DEV " | head -n 1 | sed 's/^[^ ]* on \(.*\) type .*/\1/')
+OWNED=0
+if [ -n "$MP" ] && [ "$MP" != "/" ]; then
+  mount -o rw,remount "$MP" || abort "cannot remount $MP rw"
+else
+  MP=/mnt/rksu-system; mkdir -p $MP
+  mount -o rw "$DEV" $MP || abort "cannot mount system"
+  OWNED=1
+fi
+if [ -d $MP/system/addon.d ] || [ -f $MP/system/build.prop ]; then S=$MP/system; else S=$MP; fi
+[ -f $S/build.prop ] || abort "system layout not recognised at $MP"
+mkdir -p $S/addon.d
+cp -f $T/payload/99-rksu.sh $S/addon.d/99-rksu.sh || abort "copy addon.d script (system full?)"
+chmod 755 $S/addon.d/99-rksu.sh
+chcon u:object_r:system_file:s0 $S/addon.d/99-rksu.sh 2>/dev/null
+[ "$(sha $T/payload/99-rksu.sh)" = "$(sha $S/addon.d/99-rksu.sh)" ] || abort "verify addon.d script"
+sync
+[ $OWNED = 1 ] && umount $MP
+ui_print "  /system/addon.d/99-rksu.sh installed"
+ui_print "Done. Root will be restored automatically after LineageOS updates."
+ui_print "Log: /cache/rksu/reroot.log"
+rm -rf $T
+exit 0

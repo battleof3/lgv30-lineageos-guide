@@ -1,0 +1,22 @@
+diff --git a/drivers/video/fbdev/msm/mdss_dp.c b/drivers/video/fbdev/msm/mdss_dp.c
+index 16de0109..47af9d41 100644
+--- a/drivers/video/fbdev/msm/mdss_dp.c
++++ b/drivers/video/fbdev/msm/mdss_dp.c
+@@ -235,6 +235,17 @@ static int mdss_dp_parse_prop(struct platform_device *pdev,
+ 	if (rc)
+ 		dp_drv->max_pclk_khz = DP_MAX_PIXEL_CLK_KHZ;
+ 
++	/*
++	 * LG V30 (joan): USB-C docks often run DP alt mode on 2 lanes, and link
++	 * training at HBR2 fails on them. The driver then cannot fall back to HBR
++	 * for modes above 180 MHz (2 lanes x 2.7 Gbps x 8/10 / 24 bpp), so a 4K or
++	 * 1440p EDID mode leaves the link dead and the composer blocked until
++	 * Android's watchdog restarts the phone. Cap the pixel clock so only modes
++	 * that fit 2-lane HBR (up to 1080p60, 148.5 MHz) are offered.
++	 */
++	if (dp_drv->max_pclk_khz > 165000)
++		dp_drv->max_pclk_khz = 165000;
++
+ 	return 0;
+ }
+ 

@@ -1,0 +1,6 @@
+id=v30_soundmod
+name=V30 dual speaker (SoundMod for LOS 22)
+version=1.4
+versionCode=5
+author=lgv30 (based on Mrxyzl/mrdefcon Unknown SoundMod)
+description=Plays media through the earpiece as well as the bottom speaker, in true stereo that follows rotation (with the patched kernel). Bass the earpiece can't reproduce is filtered out of its channel, and its volume is raised to match the speaker. Action button cycles the earpiece volume boost +12 dB / +6 dB / dual speaker off (applies at next reboot). Builds from this ROM's own mixer_paths at boot, so it fails safe to stock audio if the file ever changes.

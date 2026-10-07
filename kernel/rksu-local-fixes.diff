@@ -1,0 +1,62 @@
+diff --color -ruN rksu-pristine/kernel/infra/kernel_compat.h ../kernel-src/KernelSU/kernel/infra/kernel_compat.h
+--- a/infra/kernel_compat.h	2026-05-28 23:01:16.000000000 -0500
++++ b/infra/kernel_compat.h	2026-10-03 22:54:30.959655796 -0500
+@@ -34,6 +34,20 @@
+ 
+ struct file *ksu_filp_open_compat(const char *filename, int flags, umode_t mode)
+ {
++    // ksu_cred is prepared before init runs, so it has no session keyring. With it overridden
++    // (allowlist save/load run as task_work on init, not on a workqueue), opening files on
++    // FBE /data fails with -ENOKEY. Give ksu_cred init's session keyring once it is known.
++    if (init_session_keyring != NULL && current_cred() == ksu_cred && !ksu_cred->session_keyring) {
++        static DEFINE_MUTEX(ksu_cred_keyring_lock);
++
++        mutex_lock(&ksu_cred_keyring_lock);
++        if (!ksu_cred->session_keyring) {
++            pr_info("attaching init session keyring to ksu_cred\n");
++            install_session_keyring_to_cred(ksu_cred, init_session_keyring);
++        }
++        mutex_unlock(&ksu_cred_keyring_lock);
++    }
++
+     if (init_session_keyring != NULL && !current_cred()->session_keyring && (current->flags & PF_WQ_WORKER)) {
+         pr_info("installing init session keyring for older kernel\n");
+         install_session_keyring(init_session_keyring);
+diff --color -ruN rksu-pristine/kernel/selinux/selinux.c ../kernel-src/KernelSU/kernel/selinux/selinux.c
+--- a/selinux/selinux.c	2026-05-28 23:01:16.000000000 -0500
++++ b/selinux/selinux.c	2026-10-03 23:00:07.958100260 -0500
+@@ -1,11 +1,3 @@
+-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 19, 0)
+-bool __maybe_unused is_ksu_transition(const struct task_security_struct *old_tsec,
+-                                      const struct task_security_struct *new_tsec)
+-{
+-    return new_tsec->sid == old_tsec->sid;
+-}
+-#endif
+-
+ /*
+  * Cached SID values for frequently checked contexts.
+  * These are resolved once at init and used for fast u32 comparison
+@@ -23,6 +15,22 @@
+ static u32 cached_init_sid __read_mostly = 0;
+ u32 ksu_file_sid __read_mostly = 0;
+ 
++#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 19, 0)
++/*
++ * Called from check_nnp_nosuid() in security/selinux/hooks.c. /data is mounted nosuid, so
++ * init's `exec u:r:ksu:s0 -- /data/adb/ksud services|boot-completed` needs init -> ksu to be
++ * a bounded transition, which it is not. Once the execve hook is stopped (at zygote start),
++ * RKSU no longer escapes init to ksu before exec, so permit exactly init -> ksu here.
++ */
++bool is_ksu_transition(const struct task_security_struct *old_tsec, const struct task_security_struct *new_tsec)
++{
++    if (!cached_init_sid || !cached_su_sid)
++        return false;
++
++    return old_tsec->sid == cached_init_sid && new_tsec->sid == cached_su_sid;
++}
++#endif
++
+ static int transive_to_domain(const char *domain, struct cred *cred, bool clear_exec_sid)
+ {
+     u32 sid;
