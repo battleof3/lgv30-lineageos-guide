@@ -1,5 +1,7 @@
 # LG V30 (joan): LineageOS 22.2 with VoLTE, root, stereo speakers and no unlock warning
 
+This guide is also available as a [Claude Doc](https://claude.ai/artifact/WCqH8ecH6rMNPfsgcaRX4L).
+
 This guide takes an LG V30 with an unlocked bootloader, TWRP, a custom ROM and Android 9 (Pie) firmware to official LineageOS 22.2, then adds the modifications below. It was done on a US998 (a Verizon VS996 cross-flashed to US998) on Mint Mobile, a T-Mobile MVNO, in October 2026.
 
 What you end up with:
