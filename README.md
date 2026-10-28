@@ -9,7 +9,7 @@ What you end up with:
 - **Official LineageOS 22.2** (Android 15) nightly for joan, installed with Lineage Recovery. It updates through the built-in Updater.
 - **VoLTE and Wi-Fi calling** through the AOSP IMS stack from the joan-volte-lineage project. This matters because 2G/3G is gone on many US carriers.
 - **Root with RKSU** (a KernelSU fork), built into a recompiled copy of the official kernel. On a 4.4 kernel there's no way to root without rebuilding it.
-- **Root that comes back after LineageOS updates**, through an addon.d hook that re-applies the rooted kernel once the updater writes the new boot image.
+- **Root that comes back after LineageOS updates**, through an addon.d hook that re-applies the rooted kernel once the updater writes the new boot image. It works as long as the update's kernel is built from the same source (each nightly rebuilds it, and the hook accepts that). If LineageOS changes the kernel source, a PC script rebuilds first.
 - **True stereo speakers**: the earpiece plays one channel and the bottom speaker the other, and the channels swap when you turn the phone the other way. Low frequencies the small earpiece can't reproduce are filtered out of its channel, and its overall volume is raised to better match the bottom speaker. Both are fixed settings in the module's config file, applied at the next reboot.
 - **No unlocked-bootloader warning**: the orange "Your device software cannot be checked" screen shows black for the same few seconds instead.
 
@@ -224,15 +224,16 @@ Root means rebuilding the official kernel with [RKSU](https://github.com/rsuntk/
 **The quick path.** The scripts do steps 1 to 6 for you. They keep sources, toolchains and build output in `work/` inside the repository (ignored by git); set `WORK=/some/path` to put it elsewhere. With the official `boot.img` and `build-manifest.xml` of the build you installed:
 
 ```bash
-bash tools/fetch-sources.sh build-manifest.xml boot.img    # exact kernel commit + toolchains, RKSU, mkbootimg
-adb shell zcat /proc/config.gz > work/official.config       # phone still on the official kernel
+bash tools/fetch-sources.sh build-manifest.xml boot.img    # exact kernel commit + toolchains, RKSU, mkbootimg, config
 bash kernel/prepare-rksu.sh                                 # RKSU, hooks and the three patches (steps 2-3)
 bash kernel/build-kernel.sh                                 # step 4
 bash kernel/repack-boot.sh                                  # step 5, writes work/rksu-boot.img
 bash tools/flash-boot.sh work/rksu-boot.img                 # step 6, through Lineage Recovery's fastboot mode
 ```
 
-The steps below explain what each script does. Everything was tested with the 2026-09-20 nightly. A newer nightly should work the same way with its own manifest and `boot.img`, but if LineageOS changes the kernel files the patches touch, `prepare-rksu.sh` stops with a patch error and the patch needs adjusting.
+`fetch-sources.sh` also saves the manifest as `work/build-manifest.xml` and writes `work/official.config`, taken from the config the official kernel carries inside itself (the same file the phone shows as `/proc/config.gz`). To keep root across updates, then build the installer with `tools/make-reroot-zip.sh` (see [Keep root across updates](#keep-root-across-updates)). It also needs the official `boot.img` (its kernel becomes the reference for later nightlies), and it builds `tools/kcmp.c` with `tools/build-kcmp.sh`. Like `actl.c`, that needs clang with the AArch64 target and `ld.lld`: a distribution clang works, or the kernel's own in `work/toolchains/clang`.
+
+The steps below explain what each script does. Everything was tested with the 2026-09-20 nightly. The rooted kernel built from it also runs on later nightlies built from the same kernel commit (2026-09-20 to 2026-10-25 all use `c022ed57`). For a later nightly, `tools/prepare-ota.sh` tells you whether it is one of those or needs a rebuild (see [Before you update](#before-you-update)). A newer kernel commit should build the same way with its own manifest and `boot.img`, but if LineageOS changes the kernel files the patches touch, `prepare-rksu.sh` stops with a patch error and the patch needs adjusting.
 
 ### 1. Gather the exact sources
 
@@ -243,7 +244,7 @@ Read them from that build's `build-manifest.xml` (`tools/fetch-sources.sh` does 
 | Kernel | [LineageOS/android_kernel_lge_msm8998](https://github.com/LineageOS/android_kernel_lge_msm8998) | commit from the manifest (`c022ed57`) |
 | Compiler | AOSP [prebuilts/clang/host/linux-x86](https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/), `clang-r536225` | revision from the manifest (tag `android-15.0.0_r32`) |
 | Binutils | LineageOS [aarch64-linux-android-4.9](https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9) and [arm-linux-androideabi-4.9](https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9) | revisions from the manifest |
-| Config | the phone's own `/proc/config.gz` | plus `CONFIG_KSU=y`, `CONFIG_KSU_MANUAL_HOOK=y` |
+| Config | the official kernel's built-in config (the phone's `/proc/config.gz`; `fetch-sources.sh` extracts it from `boot.img`) | plus `CONFIG_KSU=y`, `CONFIG_KSU_MANUAL_HOOK=y` |
 | RKSU | [rsuntk/KernelSU](https://github.com/rsuntk/KernelSU) `main` | `648e5988` (kernel 32473) |
 | Boot tools | [platform/system/tools/mkbootimg](https://android.googlesource.com/platform/system/tools/mkbootimg) | any |
 
@@ -316,27 +317,59 @@ All three ksud stages should exit with status 0. Reboot once to confirm the Shel
 
 ## Keep root across updates
 
-Every LineageOS update writes a fresh `boot.img`, which removes root. A small hook can put the rooted kernel back automatically, as long as the update didn't change the kernel itself.
+Every LineageOS update writes a fresh `boot.img`, which removes root. A small hook can put the rooted kernel back automatically, as long as the update's kernel is built from the same source as the rooted one.
 
 **Why the obvious approach fails.** The updater script runs `backuptool.sh restore`, which runs the addon.d scripts, *before* `package_extract_file("boot.img", …)` writes the new boot image. So an addon.d script that patches the boot image is overwritten right after. The updater's last step, `/tmp/install/bin/device_check.sh`, runs after the boot image is written, and it's already unpacked by the time addon.d runs.
 
+**Why it can't compare hashes.** Every nightly rebuilds the kernel, even when its source hasn't changed. The build date and host name in the version banner, the build ID, the module-signing certificate (a new key is generated for every build) and the timestamps in the small built-in initramfs all change, and the appended device trees come out in a different order. The first version of this hook re-rooted only the exact official kernel the rooted one was built from, so it declined every real nightly and root was lost on the 2026-10-25 update. The hook now compares what the two kernels contain.
+
 The hook therefore has two parts (both in `reroot/`):
 
-- **`/system/addon.d/99-rksu.sh`**: in its post-restore stage it renames `device_check.sh` and puts a wrapper in its place. The wrapper runs the original, keeps its exit status, then runs `/cache/rksu/reroot.sh`, logging to `/cache/rksu/reroot.log`. LineageOS carries addon.d scripts forward through every update.
-- **`/cache/rksu/`**: holds `reroot.sh`, the rooted `Image.gz-dtb`, its SHA-256, the SHA-256 of the official kernel it was built from (`base-kernel.sha256`), and a `magiskboot` binary (the RKSU manager ships one). `/cache` is a separate partition that updates don't touch.
+- **`/system/addon.d/99-rksu.sh`**: in its post-restore stage it renames `device_check.sh` and puts a wrapper in its place. The wrapper runs the original, keeps its exit status, then runs `/cache/rksu/reroot.sh`, logging to `/cache/rksu/reroot.log`. If it can't install the wrapper, it says so in the same log. LineageOS carries addon.d scripts forward through every update.
+- **`/cache/rksu/`**: holds `reroot.sh`, a copy of `99-rksu.sh`, the rooted `Image.gz-dtb` and its SHA-256, the official kernel it was built from (`base-Image.gz-dtb`, the official `boot.img`'s kernel, and `base-kernel.sha256`), `kernel-source.txt` (the manifest revisions behind that kernel, for `prepare-ota.sh`), `kcmp`, a `magiskboot` binary (the RKSU manager ships one), and `payload.sha256`, the hash of every file. It takes about 38 MB. `/cache` is a separate partition that updates don't touch.
 
 What `reroot.sh` does:
 
-1. Reads the boot partition and unpacks it with `magiskboot unpack -n`, which leaves the kernel and ramdisk as stored. (magiskboot splits the appended DTBs into `kernel_dtb`; join them back before hashing.)
-2. Compares the kernel with the official kernel the rooted one was built from. If it's different, the update brought a new kernel: it leaves the boot image alone, writes `/cache/rksu/NEEDS_REBUILD`, and stops. You end up unrooted but working until you rebuild.
-3. Otherwise it swaps in the rooted kernel, runs `magiskboot repack -n`, and checks that the result has the rooted kernel and the original ramdisk.
-4. Writes it, reads it back, and if the read-back doesn't match, writes the original back.
+1. Stops if `/cache/rksu/DISABLE` exists. Checks every payload file against `payload.sha256`.
+2. Reads the boot partition and unpacks it with `magiskboot unpack -n`, which leaves the kernel and ramdisk as stored. (magiskboot splits the appended DTBs into `kernel_dtb`; join them back before comparing.)
+3. Decides whether the new kernel was built from the same source as the rooted one. If it's the rooted kernel already, there's nothing to do. If it's byte for byte the official kernel the rooted one was built from, yes. Otherwise it runs `kcmp`, which splits off the DTBs, decompresses both kernels with `magiskboot decompress`, and checks them. They count as the same source only if the decompressed kernels have the same size, every byte that differs lies in one of the build stamps above (the version banner and UTS version string, up to four references to the banner when its length changes, the build ID, the signing certificate, the built-in initramfs), and the DTBs are identical, in any order. Everything else must match, including the kernel config embedded in the kernel. If the source differs, it leaves the boot image alone, writes `/cache/rksu/NEEDS_REBUILD`, and stops. You end up unrooted but working until you rebuild. If the comparison itself fails (not enough memory in `/tmp`, a decompression error), it also leaves the boot image alone.
+4. Otherwise it swaps in the rooted kernel, keeping the new ramdisk and boot image header, runs `magiskboot repack -n`, and checks that the result has the rooted kernel and the new ramdisk.
+5. Writes it, reads it back, and if the read-back doesn't match, writes the original back.
 
-Install both parts with a small flashable zip sideloaded from Lineage Recovery. `bash tools/make-reroot-zip.sh <RKSU manager .apk>` builds it as `work/rksu-reroot-installer.zip`: `reroot/update-binary` as the installer, plus a `payload/` folder with `99-rksu.sh`, `reroot.sh`, your rooted `Image.gz-dtb` and its hash, the official kernel's hash (taken from `work/boot.img`), and `magiskboot` (taken from the manager APK, where it's `lib/arm64-v8a/libmagiskboot.so`). It's unsigned, so tap **Yes** at the warning. The installer mounts `/system` the way the VoLTE zip does: it reuses recovery's own read-only mount and remounts it read-write, rather than mounting it a second time.
+`kcmp` is a small libc-free static binary (`tools/kcmp.c`); `tests/run-host-tests.sh` checks it on the PC against official builds and deliberately altered kernels (one changed instruction, one changed DTB byte and so on are all rejected).
 
-**To test it**, sideload the same official zip you're already on, without wiping. That's a full update run. The phone should boot rooted, and `reroot.log` should say `boot partition re-rooted`. Here, the VoLTE stack's own addon.d script ran in the same pass.
+Install both parts with a small flashable zip sideloaded from Lineage Recovery. `bash tools/make-reroot-zip.sh <RKSU manager .apk> [Image.gz-dtb] [official boot.img] [output.zip]` builds it. By default it takes your rooted kernel from the build output and `work/boot.img` and `work/build-manifest.xml` from `fetch-sources.sh`, and writes `work/rksu-reroot-installer.zip`. The zip holds `reroot/update-binary` as the installer, plus a `payload/` folder with the files above (`magiskboot` comes from the manager APK, where it's `lib/arm64-v8a/libmagiskboot.so`). The script also writes `work/rksu-reroot-disable.zip` and a copy of the payload in `work/payload/`. The zip is unsigned, so tap **Yes** at the warning. The installer checks every file, keeps the previous payload until the new one is verified, and dry-runs `reroot.sh` on a copy of the boot partition; it never writes the boot partition itself. It mounts `/system` the way the VoLTE zip does: it reuses recovery's own read-only mount and remounts it read-write, rather than mounting it a second time.
 
-**When you rebuild the kernel** (for example after `NEEDS_REBUILD`, or to add a patch), update `/cache/rksu` with the new image and its hash. `tools/update-payload.sh <Image.gz-dtb> <rksu-boot.img>` does this (it restores the previous payload if the check fails), then dry-runs `reroot.sh` against the official `boot.img` and checks that it reproduces your flashed image byte for byte.
+**To test it**, sideloading the same official zip you're already on isn't enough: its kernel is the exact one the rooted kernel was built from, so the source comparison never runs. (That's how the first version's flaw went unnoticed.) Instead, sideload a later nightly built from the same kernel commit (`prepare-ota.sh` tells you, see below) without wiping. The phone should boot rooted, and `reroot.log` should end with `RESULT: REROOTED same source as base (kcmp)`. Here, the VoLTE stack's own addon.d script ran in the same pass. To check without updating, dry-run it against a nightly's official `boot.img` copied to the phone; it writes nothing:
+
+```bash
+adb push boot.img /data/local/tmp/
+adb shell su -c 'RKSU_WORK=/data/local/tmp/rksu-work sh /cache/rksu/reroot.sh --test /data/local/tmp/boot.img /data/local/tmp/out.img'
+```
+
+**Reading the log.** Each run of `reroot.sh` logs its decision and ends with one `RESULT:` line. The log is only readable with root: `adb shell su -c 'grep RESULT: /cache/rksu/reroot.log | tail -n 3'`. It is trimmed to `reroot.log.old` once it passes 256 KB.
+
+| `RESULT:` | Meaning |
+|---|---|
+| `REROOTED exact base kernel` or `REROOTED same source as base (kcmp)` | the boot partition now has the rooted kernel; the line includes the new boot image's SHA-256 |
+| `ALREADY` | the boot partition already had the rooted kernel |
+| `NEEDS_REBUILD` | the update's kernel was built from different source; boot left official, rebuild with `prepare-ota.sh` |
+| `FAILED <reason>` | something went wrong (for example `FAILED kcmp path: ...` if the comparison couldn't run, or `FAILED hook not installed` from `99-rksu.sh`); boot left as the updater wrote it |
+| `DISABLED` | `/cache/rksu/DISABLE` exists; nothing was done |
+
+**Turning the hook off.** Create `/cache/rksu/DISABLE` (`adb shell su -c touch /cache/rksu/DISABLE`), and delete it to turn the hook back on. If the phone doesn't boot, sideload `work/rksu-reroot-disable.zip` from Lineage Recovery instead (unsigned, tap **Yes**); it only creates that file.
+
+**When you rebuild the kernel** (for example after `NEEDS_REBUILD`, or to add a patch), build the payload again with `make-reroot-zip.sh`, then install it with `bash tools/update-payload.sh <rksu-boot.img> <official boot.img> [payload dir]` (the payload folder defaults to `work/payload`). It needs root over adb. It copies every payload file into `/cache/rksu` and checks it, then dry-runs `reroot.sh` against the official `boot.img` and checks that it reproduces `rksu-boot.img` byte for byte. If anything fails it restores the previous payload; otherwise it keeps the previous one in `/data/local/tmp/rksu-stage.prev`. It doesn't update `/system/addon.d/99-rksu.sh`; the zip does.
+
+### Before you update
+
+Run `bash tools/prepare-ota.sh <YYYYMMDD>` on the PC with the date of the nightly you're about to install. It downloads that nightly's `boot.img` and `build-manifest.xml` and checks their SHA-256 against the LineageOS builds API. It also reads the update zip's `updater-script` (only a few KB of the zip, through HTTP range requests) to confirm the order the hook relies on: addon.d restore, then `boot.img`, then `device_check.sh`. It compares the kernel and toolchain revisions with the payload's `kernel-source.txt` (from `work/payload`, or `PAYLOAD_DIR`), and runs `kcmp` on the new kernel against the payload's reference kernel, the same way the phone will.
+
+- `same source: the hook will re-root this update` (exit 0): install the update from the Updater app or by sideloading; both run the hook.
+- `kernel source changed: rebuild` (exit 3): it fetches that build's sources into `work/ota-<date>`, rebuilds and repacks the kernel, and builds a new payload (set `RKSU_APK` to the manager APK first). It then prints the `update-payload.sh` command to run with the phone connected, and how to make the new payload the one it compares against next time. Run it before you install the update. `--check` stops after the verdict.
+- `updater-script changed` (exit 4): the hook would no longer run after `boot.img` is written, so the update would leave you unrooted. Exit 1 means something failed, such as a download or checksum.
+
+It keeps the nightly's official `boot.img` in `work/ota-<date>/official/`, your rollback image if the re-rooted boot misbehaves.
 
 ## Stereo speakers
 
@@ -472,7 +505,10 @@ The biggest one: **USB-C video out (HDMI adapters and docks) doesn't work on the
 | USB-C video out | the phone detects the adapter, reads the monitor's EDID and picks a mode, but DisplayPort link training fails at every speed, in both plug orientations, on 2 or 4 lanes. LineageOS uses LG's exact display configuration, and stock-firmware owners reported the same drop-outs. | treat it as unsupported. Without the pixel-clock cap, accepting "Mirror display?" can freeze the screen until the watchdog restarts the phone. Rebooting with a dock attached can hang at shutdown. |
 | After a failed USB-C video attempt | the USB-C controller won't negotiate video mode again | reboot with the adapter unplugged |
 | Bootloader fastboot | `fastboot flash` in the bootloader refused a 33 MB image | use Lineage Recovery's fastboot mode (`adb reboot fastboot`), or `dd` from a root shell |
-| Fingerprint | the service crash-looped for about two days (secure-world app rejecting every command), on the official kernel too, with its files unchanged since the backup. It later recovered by itself, probably after a full power-off. | power the phone fully off (not a restart) and leave it off for a while. Then disable the `no-fingerprint` module if it's enabled, boot, and check whether fingerprint works and the crashes have stopped. If the crash loop is still there, enable the module again to silence it. |
+| Fingerprint | the LG fingerprint service crash-loops: the secure-world app rejects every command, the HAL fails to open and the service crashes. It has happened twice, each time right after a new LineageOS build was installed (the second time right after the 2026-10-25 update). It happens on the official kernel too, so root isn't the cause, and its files are unchanged since the backup. The first episode cleared by itself after about two days, probably after a full power-off; the second survived a full power-off. The cause is unknown. | enable the `no-fingerprint` module to silence it (fingerprint unlock is unavailable while it's on). To try fingerprint again later, disable the module and reboot; if the crash loop is back, enable it again. |
+| Root lost on every nightly (older hook) | the first version of the re-root hook only accepted the exact official kernel the rooted one was built from. Every nightly rebuilds the kernel, so it declined every real update. | install the current payload: the installer zip from `make-reroot-zip.sh`, or `update-payload.sh` |
+| The hook depends on the updater script | re-rooting works only because `device_check.sh` runs after `boot.img` is written. If LineageOS changes that, root is lost after updates (never a brick), and `reroot.log` has no new `RESULT:` line or says `FAILED hook not installed`. | `prepare-ota.sh` checks the order before each update |
+| Updating when the kernel source changed | the hook declines (`RESULT: NEEDS_REBUILD`) and the phone boots the official kernel unrooted, so the modules are off (stereo speakers, adb over Wi-Fi, the gamepad fix) until you rebuild | run `prepare-ota.sh` before updating; it rebuilds when needed |
 | Restarting the audio HAL | `setprop ctl.restart vendor.audio-hal` can crash system_server (sound-trigger reconnect) and soft-reboot the phone | apply audio changes with a reboot |
 | `tfa_start failed! (err 78)` in the kernel log | the speaker amp's first start attempt fails and the driver retries | harmless; the retry succeeds within milliseconds |
 | `raw_resources` | the bootloader needs a valid, signed container there | never zero or hand-edit it; only write a genuine signed image, and keep the backup |
@@ -499,12 +535,13 @@ Every step here can be undone, as long as you keep the partition backup, the off
 | To undo | Do this |
 |---|---|
 | A kernel that won't boot | hold Volume Down + Power; at the LG logo release Power briefly, then hold it again; accept the factory-reset prompt (with Lineage Recovery installed it opens recovery and wipes nothing); Advanced → Enter fastboot; `fastboot flash boot boot.img` |
-| Root | flash the official `boot.img` through recovery's fastboot mode, and delete `/system/addon.d/99-rksu.sh` (or sideload the official zip again without wiping) |
-| The stereo kernel patch | flash a rooted kernel built without `lgv30-dual-speaker.diff` (or the official `boot.img`), and update `/cache/rksu` to match |
+| Root | create `/cache/rksu/DISABLE` (or delete `/system/addon.d/99-rksu.sh` and `/cache/rksu`), then flash the official `boot.img` through recovery's fastboot mode. Re-sideloading the official zip alone isn't enough: the hook would re-root it. |
+| The stereo kernel patch | flash a rooted kernel built without `lgv30-dual-speaker.diff` (or the official `boot.img`), and update `/cache/rksu` to match (`make-reroot-zip.sh`, then `update-payload.sh`) |
 | VoLTE stack | sideload `aosp-ims-...-uninstall.zip` from Lineage Recovery |
 | A KernelSU module | disable or uninstall it in the manager's Modules tab, then reboot. If a module stops the phone booting, press Volume Down several times (3 or more) during boot to start KernelSU in safe mode with modules disabled. |
 | The black boot-warning screen | write the backed-up `raw_resources.img` back with `dd` (same checks as `tools/write-raw-resources.sh`) |
-| Root lost after an update | `/cache/rksu/NEEDS_REBUILD` exists: rebuild the kernel from the new build's manifest, flash it, and run `tools/update-payload.sh` |
+| Root lost after an update | run `tools/prepare-ota.sh <date>` for the build you installed. If it says `kernel source changed`, it rebuilds; flash `work/ota-<date>/rksu-boot.img` and run the `update-payload.sh` command it prints. If it says `same source`, flash your rooted kernel repacked into that build's `boot.img` (`kernel/repack-boot.sh`), then read the last `RESULT:` line in `reroot.log`. If it's `FAILED hook not installed` or missing, flash the installer zip again. |
+| Boot loop after an update re-rooted the phone | flash that nightly's official `boot.img` (kept in `work/ota-<date>/official/`) through recovery's fastboot mode; that doesn't run the hook. Don't re-sideload the same update until the hook is off (sideload `rksu-reroot-disable.zip`, create `/cache/rksu/DISABLE`, or delete `/system/addon.d/99-rksu.sh`), or it writes the same kernel again. |
 | IMEI or calibration damage | from TWRP or a root shell, `dd` the backed-up `modemst1`, `modemst2`, `fsg`, `persist` or `drm` image back to its partition |
 | Back to TWRP | `dd` the backed-up `recovery.img` from the original setup into the recovery partition (TWRP can't install LineageOS 22.2, though) |
 
@@ -520,23 +557,33 @@ kernel/
   dp-max-pclk.diff             DisplayPort pixel-clock cap (prevents dock freezes)
   lgv30-dual-speaker.diff      speaker amp slot, rotation swap, wcd934x IIR caching fix
 reroot/
-  99-rksu.sh                   addon.d hook
-  reroot.sh                    re-roots the boot image after an update
+  99-rksu.sh                   addon.d hook: wraps device_check.sh so reroot.sh runs after boot.img is written
+  reroot.sh                    re-roots the boot image after an update (exact match or kcmp, then verified write)
   update-binary                installer for the flashable zip (payload/ folder alongside)
+  disable-update-binary        installer for rksu-reroot-disable.zip (creates /cache/rksu/DISABLE)
 modules/
   v30-soundmod/                stereo speakers (mixer-path patcher, settings, Action button)
   no-fingerprint/              hides a crash-looping fingerprint sensor
   hid-generic-fix/             ShanWan 20bc:5500 gamepad binding
   adb-wifi/                    adb over Wi-Fi on port 5555
+tests/
+  run-host-tests.sh            PC tests for kcmp, reroot.sh, the hook and the payload tools (no phone)
+  magiskboot-stub.py           stands in for magiskboot in those tests
 test-audio/
   lr-tones.ogg                 left / right / both at different pitches: which speaker plays which channel
   lr-1khz.ogg                  left / right / both at the same pitch: loudness balance
   make-test-tones.py           regenerates both (needs ffmpeg)
 tools/
-  fetch-sources.sh             fetches the kernel source and toolchains a build's manifest names, plus RKSU
+  fetch-sources.sh             fetches the kernel source and toolchains a build's manifest names, plus RKSU;
+                               saves the manifest and the official kernel config
   flash-boot.sh                flashes a boot image through Lineage Recovery's fastboot mode
-  make-reroot-zip.sh           builds the re-root installer zip
-  update-payload.sh            installs a new kernel into /cache/rksu and dry-runs the re-root
+  kcmp.c                       libc-free tool that decides whether two kernels were built from the same source
+  build-kcmp.sh                builds kcmp: static aarch64 for the phone, or --host for the tests
+  kernel-source.sh             writes kernel-source.txt (a build's kernel and toolchain revisions)
+  make-reroot-zip.sh           builds the re-root installer zip, the disable zip and work/payload/
+  update-payload.sh            installs a new payload into /cache/rksu over adb and dry-runs the re-root
+  update-payload-device.sh     the part of update-payload.sh that runs on the phone
+  prepare-ota.sh               before an update: will the hook re-root it, or rebuild first
   write-raw-resources.sh       writes a raw_resources image with before/after checks
   actl.c                       libc-free ALSA mixer-control tool for testing on the phone
 ```
@@ -546,7 +593,7 @@ The scripts keep sources, toolchains and build output in `work/` (ignored by git
 ## Sources
 
 - [LineageOS wiki: joan](https://wiki.lineageos.org/devices/joan/) and [lineage_wiki device data](https://github.com/LineageOS/lineage_wiki/tree/main/_data/devices)
-- [LineageOS downloads for joan](https://download.lineageos.org/devices/joan)
+- [LineageOS downloads for joan](https://download.lineageos.org/devices/joan) and its [builds API](https://download.lineageos.org/api/v2/devices/joan/builds) (file checksums, used by `tools/prepare-ota.sh`)
 - [LineageOS/android_kernel_lge_msm8998](https://github.com/LineageOS/android_kernel_lge_msm8998) and [android_device_lge_joan-common](https://github.com/LineageOS/android_device_lge_joan-common)
 - [ShapeShifter499/joan-volte-lineage](https://github.com/ShapeShifter499/joan-volte-lineage)
 - [rsuntk/KernelSU (RKSU)](https://github.com/rsuntk/KernelSU)

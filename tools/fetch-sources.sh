@@ -54,8 +54,19 @@ fi
 echo "clang: $("$WORK/toolchains/clang/bin/clang" --version | head -1)"
 
 cp "$BOOT" "$WORK/boot.img"
-echo "official boot.img copied to $WORK/boot.img (sha256 $(sha256sum "$WORK/boot.img" | cut -c1-16)...)"
-echo
-echo "Next, with the phone booted on this official build's kernel:"
-echo "  adb shell zcat /proc/config.gz > $WORK/official.config"
-echo "  adb shell cat /proc/version      # should name clang-$CLANG_VERSION"
+cp "$MANIFEST" "$WORK/build-manifest.xml"
+echo "official boot.img copied to $WORK/boot.img (sha256 $(sha256sum "$WORK/boot.img" | cut -c1-16)...), manifest to $WORK/build-manifest.xml"
+
+# The official kernel embeds its config (CONFIG_IKCONFIG, the same data as /proc/config.gz): extract it.
+if [[ ! -f $WORK/official.config ]]; then
+  python3 - "$WORK/boot.img" "$WORK/official.config" <<'PY'
+import gzip, struct, sys, zlib
+b = open(sys.argv[1], "rb").read()
+ksize, page = struct.unpack_from("<I", b, 8)[0], struct.unpack_from("<I", b, 36)[0]
+image = zlib.decompressobj(16 + 15).decompress(b[page:page + ksize])   # Image.gz-dtb: gzip, then DTBs
+s, e = image.find(b"IKCFG_ST"), image.find(b"IKCFG_ED")
+assert 0 < s < e, "kernel has no embedded config"
+open(sys.argv[2], "wb").write(gzip.decompress(image[s + 8:e]))
+PY
+  echo "official kernel config extracted to $WORK/official.config ($(grep -c '^CONFIG_' "$WORK/official.config") options)"
+fi

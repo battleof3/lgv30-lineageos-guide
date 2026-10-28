@@ -1,6 +1,7 @@
 #!/sbin/sh
 # rksu-reroot-installer: installs /cache/rksu (payload) and /system/addon.d/99-rksu.sh
 # so RKSU root is restored automatically after LineageOS updates. Flash from LineageOS recovery.
+# Never writes the boot partition: its self-test is a dry run (reroot.sh --test) on a copy of boot.
 
 OUTFD=$2
 ZIPFILE=$3
@@ -8,28 +9,49 @@ ui_print() { echo "ui_print $1" > /proc/self/fd/$OUTFD; echo "ui_print" > /proc/
 abort() { ui_print "ERROR: $1"; exit 1; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
+PAYLOAD="reroot.sh 99-rksu.sh magiskboot kcmp Image.gz-dtb Image.gz-dtb.sha256 base-Image.gz-dtb base-kernel.sha256 kernel-source.txt payload.sha256"
+R=/cache/rksu
 T=/tmp/rksu-inst
 rm -rf $T; mkdir -p $T
 unzip -o -q "$ZIPFILE" 'payload/*' -d $T || abort "cannot unpack zip"
 P=$T/payload
 
-ui_print "RKSU re-root installer (LG V30 / joan)"
+ui_print "RKSU re-root installer v2 (LG V30 / joan)"
 
-# --- /cache payload
+# --- check the payload inside the zip against its own manifest (every file, including 99-rksu.sh)
+for f in $PAYLOAD; do
+  [ $f = payload.sha256 ] || grep -q "  $f\$" $P/payload.sha256 || abort "payload.sha256 does not list $f"
+done
+while read -r h f; do
+  [ "$(sha "$P/$f")" = "$h" ] || abort "zip payload $f is corrupt"
+done < $P/payload.sha256
+
+# --- /cache payload: back up the old one to /tmp, copy, verify, restore the old one on any failure
 grep -q ' /cache ' /proc/mounts || mount /cache 2>/dev/null \
   || mount -t ext4 /dev/block/bootdevice/by-name/cache /cache || abort "cannot mount /cache"
-mkdir -p /cache/rksu || abort "cannot create /cache/rksu"
-for f in Image.gz-dtb Image.gz-dtb.sha256 base-kernel.sha256 reroot.sh magiskboot; do
-  cp -f "$P/$f" /cache/rksu/$f || abort "copy $f"
-  [ "$(sha "$P/$f")" = "$(sha /cache/rksu/$f)" ] || abort "verify $f"
+mkdir -p $R || abort "cannot create $R"
+rm -rf $T/old; mkdir -p $T/old
+for f in $PAYLOAD; do [ -f $R/$f ] && cp -f $R/$f $T/old/$f; done
+restore() {
+  for f in $PAYLOAD; do rm -f $R/$f; [ -f $T/old/$f ] && cp -f $T/old/$f $R/$f; done
+  chmod 755 $R/magiskboot $R/reroot.sh $R/kcmp 2>/dev/null
+  abort "$1 (previous payload restored)"
+}
+for f in $PAYLOAD; do
+  cp -f "$P/$f" $R/$f || restore "copy $f (is /cache full?)"
+  [ "$(sha "$P/$f")" = "$(sha $R/$f)" ] || restore "verify $f"
 done
-chmod 755 /cache/rksu/magiskboot /cache/rksu/reroot.sh
+chmod 755 $R/magiskboot $R/reroot.sh $R/kcmp $R/99-rksu.sh
 ui_print "  /cache/rksu payload installed and verified"
 
-# --- self-test: magiskboot works here and the boot partition is already RKSU
-ui_print "  self-test (reads boot, writes nothing when already rooted):"
-RES=$(sh /cache/rksu/reroot.sh 2>&1 | tee -a /cache/rksu/reroot.log | tail -n 1)
-ui_print "    $RES"
+# --- self-test: dry run against a copy of the boot partition (writes nothing)
+ui_print "  self-test (dry run on a copy of boot, writes nothing):"
+dd if=/dev/block/bootdevice/by-name/boot of=$T/boot.img bs=4096 2>/dev/null
+RES=$(RKSU_WORK=$T/work sh $R/reroot.sh --test $T/boot.img $T/out.img 2>&1 | tee -a $R/reroot.log | grep 'RESULT:' | tail -n 1)
+ui_print "    ${RES#*RESULT: }"
+case "$RES" in
+  *"RESULT: FAILED"*) restore "self-test failed" ;;
+esac
 
 # --- /system/addon.d script (system is a logical partition; recovery may already hold it ro)
 DEV=$(readlink -f /dev/block/mapper/system 2>/dev/null)
@@ -54,7 +76,11 @@ chcon u:object_r:system_file:s0 $S/addon.d/99-rksu.sh 2>/dev/null
 sync
 [ $OWNED = 1 ] && umount $MP
 ui_print "  /system/addon.d/99-rksu.sh installed"
-ui_print "Done. Root will be restored automatically after LineageOS updates."
+case "$RES" in
+  *"RESULT: ALREADY"*) ui_print "Done. Boot is rooted; root will be restored after LineageOS updates." ;;
+  *"RESULT: REROOTED"*) ui_print "Done. Boot is the official kernel; the hook would re-root it (it does on the next update)." ;;
+  *) ui_print "Done, but the current boot kernel is not one this payload can re-root (see reroot.log)." ;;
+esac
 ui_print "Log: /cache/rksu/reroot.log"
 rm -rf $T
 exit 0

@@ -1,0 +1,15 @@
+#!/sbin/sh
+# rksu-reroot-disable: creates /cache/rksu/DISABLE, so the update hook (reroot.sh) writes nothing.
+# For when a re-rooted boot misbehaves: sideload this, then reinstall or re-sideload the update safely.
+# Undo: delete /cache/rksu/DISABLE (adb shell su -c rm /cache/rksu/DISABLE), or reinstall the payload and delete it.
+
+OUTFD=$2
+ui_print() { echo "ui_print $1" > /proc/self/fd/$OUTFD; echo "ui_print" > /proc/self/fd/$OUTFD; }
+grep -q ' /cache ' /proc/mounts || mount /cache 2>/dev/null \
+  || mount -t ext4 /dev/block/bootdevice/by-name/cache /cache || { ui_print "ERROR: cannot mount /cache"; exit 1; }
+mkdir -p /cache/rksu && echo "disabled $(date '+%F %T' 2>/dev/null) by rksu-reroot-disable.zip" > /cache/rksu/DISABLE \
+  || { ui_print "ERROR: cannot write /cache/rksu/DISABLE"; exit 1; }
+echo "[rksu $(date '+%F %T' 2>/dev/null)] DISABLE set by rksu-reroot-disable.zip" >> /cache/rksu/reroot.log
+sync
+ui_print "RKSU re-root hook disabled (/cache/rksu/DISABLE). Updates will leave the boot partition alone."
+exit 0
